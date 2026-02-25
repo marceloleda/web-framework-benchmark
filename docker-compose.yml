@@ -1,0 +1,89 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: benchmark_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: benchmark
+      POSTGRES_USER: benchmark
+      POSTGRES_PASSWORD: benchmark
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./scripts/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U benchmark -d benchmark"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api-express:
+    build: ./api-express
+    container_name: benchmark_express
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://benchmark:benchmark@postgres:5432/benchmark
+      PORT: 3001
+    ports:
+      - "3001:3001"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api-fastify:
+    build: ./api-fastify
+    container_name: benchmark_fastify
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://benchmark:benchmark@postgres:5432/benchmark
+      PORT: 3002
+    ports:
+      - "3002:3002"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api-elysia:
+    build: ./api-elysia
+    container_name: benchmark_elysia
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://benchmark:benchmark@postgres:5432/benchmark
+      PORT: 3003
+    ports:
+      - "3003:3003"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api-actix:
+    build: ./api-actix
+    container_name: benchmark_actix
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://benchmark:benchmark@postgres:5432/benchmark
+      PORT: 3004
+    ports:
+      - "3004:3004"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api-gin:
+    build: ./api-gin
+    container_name: benchmark_gin
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://benchmark:benchmark@postgres:5432/benchmark
+      PORT: 3005
+    ports:
+      - "3005:3005"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  pgdata:

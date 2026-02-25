@@ -1,0 +1,16 @@
+{
+  "name": "api-elysia",
+  "version": "1.0.0",
+  "description": "Elysia/Bun REST API for web framework benchmark",
+  "scripts": {
+    "start": "bun run src/index.ts",
+    "dev": "bun --watch src/index.ts"
+  },
+  "dependencies": {
+    "elysia": "^1.1.0",
+    "postgres": "^3.4.4"
+  },
+  "devDependencies": {
+    "bun-types": "latest"
+  }
+}
