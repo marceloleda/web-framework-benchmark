@@ -216,12 +216,101 @@ func handleQueries(db *sql.DB) gin.HandlerFunc {
 	}
 }
 
+// PaginatedUsers is the response shape when pagination params are provided.
+type PaginatedUsers struct {
+	Data   []User `json:"data"`
+	Total  int    `json:"total"`
+	Limit  int    `json:"limit"`
+	Offset int    `json:"offset"`
+}
+
 // GET /users — all users ordered by id
+// Optional: ?limit=N (1-100) and ?offset=N (>=0) for pagination.
 func handleGetUsers(db *sql.DB) gin.HandlerFunc {
-	const query = `SELECT id, name, email, age, created_at FROM users ORDER BY id`
+	const fullQuery = `SELECT id, name, email, age, created_at FROM users ORDER BY id`
+	const pageQuery = `SELECT id, name, email, age, created_at FROM users ORDER BY id LIMIT $1 OFFSET $2`
+	const countQuery = `SELECT COUNT(*)::int FROM users`
 
 	return func(c *gin.Context) {
-		rows, err := db.QueryContext(c.Request.Context(), query)
+		limitStr := c.Query("limit")
+		if limitStr != "" {
+			limit := 20
+			if n, err := strconv.Atoi(limitStr); err == nil {
+				limit = n
+			}
+			if limit < 1 {
+				limit = 1
+			}
+			if limit > 100 {
+				limit = 100
+			}
+
+			offset := 0
+			if offsetStr := c.Query("offset"); offsetStr != "" {
+				if n, err := strconv.Atoi(offsetStr); err == nil && n > 0 {
+					offset = n
+				}
+			}
+
+			// Run COUNT and paginated SELECT concurrently.
+			type countResult struct {
+				total int
+				err   error
+			}
+			type rowsResult struct {
+				users []User
+				err   error
+			}
+
+			countCh := make(chan countResult, 1)
+			rowsCh := make(chan rowsResult, 1)
+
+			go func() {
+				var total int
+				err := db.QueryRowContext(c.Request.Context(), countQuery).Scan(&total)
+				countCh <- countResult{total, err}
+			}()
+
+			go func() {
+				rows, err := db.QueryContext(c.Request.Context(), pageQuery, limit, offset)
+				if err != nil {
+					rowsCh <- rowsResult{nil, err}
+					return
+				}
+				defer rows.Close()
+				users := make([]User, 0, limit)
+				for rows.Next() {
+					user, err := scanUser(rows.Scan)
+					if err != nil {
+						rowsCh <- rowsResult{nil, err}
+						return
+					}
+					users = append(users, user)
+				}
+				rowsCh <- rowsResult{users, rows.Err()}
+			}()
+
+			cr := <-countCh
+			if cr.err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Database error", "detail": cr.err.Error()})
+				return
+			}
+			rr := <-rowsCh
+			if rr.err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Database error", "detail": rr.err.Error()})
+				return
+			}
+
+			c.JSON(http.StatusOK, PaginatedUsers{
+				Data:   rr.users,
+				Total:  cr.total,
+				Limit:  limit,
+				Offset: offset,
+			})
+			return
+		}
+
+		rows, err := db.QueryContext(c.Request.Context(), fullQuery)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Database error", "detail": err.Error()})
 			return

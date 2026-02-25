@@ -79,9 +79,23 @@ app.get('/queries', async (req, res) => {
   }
 });
 
-// GET /users — all users
-app.get('/users', async (_req, res) => {
+// GET /users — lista todos os usuários (com paginação opcional)
+// ?limit=N  (1-100, default todos)
+// ?offset=N (>= 0, default 0)
+app.get('/users', async (req, res) => {
   try {
+    if (req.query.limit !== undefined) {
+      const limit  = Math.min(100, Math.max(1, parseInt(req.query.limit,  10) || 20));
+      const offset = Math.max(0,            parseInt(req.query.offset, 10) || 0);
+      const [data, count] = await Promise.all([
+        pool.query(
+          'SELECT id, name, email, age, created_at FROM users ORDER BY id LIMIT $1 OFFSET $2',
+          [limit, offset]
+        ),
+        pool.query('SELECT COUNT(*)::int AS total FROM users'),
+      ]);
+      return res.json({ data: data.rows, total: count.rows[0].total, limit, offset });
+    }
     const result = await pool.query(
       'SELECT id, name, email, age, created_at FROM users ORDER BY id'
     );

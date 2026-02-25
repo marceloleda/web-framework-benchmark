@@ -123,14 +123,48 @@ fastify.get('/queries', {
   return rows;
 });
 
-// GET /users — all users
+// GET /users — lista todos os usuários (com paginação opcional)
+// ?limit=N  (1-100, default todos)
+// ?offset=N (>= 0, default 0)
 fastify.get('/users', {
   schema: {
+    querystring: {
+      type: 'object',
+      properties: {
+        limit:  { type: 'integer', minimum: 1, maximum: 100 },
+        offset: { type: 'integer', minimum: 0, default: 0 },
+      },
+    },
     response: {
-      200: userArraySchema,
+      200: {
+        oneOf: [
+          userArraySchema,
+          {
+            type: 'object',
+            properties: {
+              data:   userArraySchema,
+              total:  { type: 'integer' },
+              limit:  { type: 'integer' },
+              offset: { type: 'integer' },
+            },
+          },
+        ],
+      },
     },
   },
-}, async (_req, _reply) => {
+}, async (req, _reply) => {
+  if (req.query.limit !== undefined) {
+    const limit  = Math.min(100, Math.max(1, parseInt(req.query.limit,  10) || 20));
+    const offset = Math.max(0,            parseInt(req.query.offset, 10) || 0);
+    const [data, count] = await Promise.all([
+      pool.query(
+        'SELECT id, name, email, age, created_at FROM users ORDER BY id LIMIT $1 OFFSET $2',
+        [limit, offset]
+      ),
+      pool.query('SELECT COUNT(*)::int AS total FROM users'),
+    ]);
+    return { data: data.rows, total: count.rows[0].total, limit, offset };
+  }
   const { rows } = await pool.query(
     'SELECT id, name, email, age, created_at FROM users ORDER BY id'
   );

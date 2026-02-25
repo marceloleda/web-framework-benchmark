@@ -95,16 +95,44 @@ const app = new Elysia()
   )
 
   // -------------------------------------------------------------------------
-  // GET /users  — all users
+  // GET /users  — lista todos os usuários (com paginação opcional)
+  // ?limit=N  (1-100, default todos)
+  // ?offset=N (>= 0, default 0)
   // -------------------------------------------------------------------------
-  .get("/users", async () => {
-    const rows = await sql<User[]>`
-      SELECT id, name, email, age, created_at
-      FROM users
-      ORDER BY id
-    `;
-    return rows;
-  })
+  .get(
+    "/users",
+    async ({ query }) => {
+      if (query.limit !== undefined) {
+        const limit  = Math.min(100, Math.max(1, Number(query.limit)  || 20));
+        const offset = Math.max(0,             Number(query.offset) || 0);
+
+        const [data, countRows] = await Promise.all([
+          sql<User[]>`
+            SELECT id, name, email, age, created_at
+            FROM users
+            ORDER BY id
+            LIMIT ${limit} OFFSET ${offset}
+          `,
+          sql<[{ total: number }]>`SELECT COUNT(*)::int AS total FROM users`,
+        ]);
+
+        return { data, total: countRows[0].total, limit, offset };
+      }
+
+      const rows = await sql<User[]>`
+        SELECT id, name, email, age, created_at
+        FROM users
+        ORDER BY id
+      `;
+      return rows;
+    },
+    {
+      query: t.Object({
+        limit:  t.Optional(t.String()),
+        offset: t.Optional(t.String()),
+      }),
+    }
+  )
 
   // -------------------------------------------------------------------------
   // GET /users/:id  — single user by id

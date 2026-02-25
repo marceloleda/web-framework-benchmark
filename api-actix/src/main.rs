@@ -158,9 +158,28 @@ async fn queries_endpoint(
     HttpResponse::Ok().json(users)
 }
 
-/// GET /users  — returns all users.
+/// Query parameters for GET /users (paginação opcional).
+#[derive(Deserialize)]
+pub struct UsersParams {
+    pub limit:  Option<i64>,
+    pub offset: Option<i64>,
+}
+
+/// Resposta paginada para GET /users?limit=N.
+#[derive(Serialize)]
+pub struct PaginatedUsers {
+    pub data:   Vec<User>,
+    pub total:  i64,
+    pub limit:  i64,
+    pub offset: i64,
+}
+
+/// GET /users  — retorna todos os usuários ou uma página quando ?limit=N é informado.
 #[get("/users")]
-async fn get_users(data: web::Data<AppState>) -> impl Responder {
+async fn get_users(
+    data:  web::Data<AppState>,
+    query: web::Query<UsersParams>,
+) -> impl Responder {
     let client = match data.pool.get().await {
         Ok(c) => c,
         Err(e) => {
@@ -170,6 +189,46 @@ async fn get_users(data: web::Data<AppState>) -> impl Responder {
         }
     };
 
+    if let Some(limit_raw) = query.limit {
+        // ── Paginação ──────────────────────────────────────────────────────
+        let limit:  i64 = limit_raw.clamp(1, 100);
+        let offset: i64 = query.offset.unwrap_or(0).max(0);
+
+        // Contagem total
+        let total: i64 = match client
+            .query_one("SELECT COUNT(*)::bigint FROM users", &[])
+            .await
+        {
+            Ok(r)  => r.get(0),
+            Err(e) => {
+                eprintln!("Count query error: {e}");
+                return HttpResponse::InternalServerError()
+                    .json(serde_json::json!({ "error": "Database query error" }));
+            }
+        };
+
+        // Página de dados
+        let rows = match client
+            .query(
+                "SELECT id, name, email, age, created_at \
+                 FROM users ORDER BY id LIMIT $1 OFFSET $2",
+                &[&limit, &offset],
+            )
+            .await
+        {
+            Ok(r)  => r,
+            Err(e) => {
+                eprintln!("Query error: {e}");
+                return HttpResponse::InternalServerError()
+                    .json(serde_json::json!({ "error": "Database query error" }));
+            }
+        };
+
+        let users: Vec<User> = rows.iter().map(row_to_user).collect();
+        return HttpResponse::Ok().json(PaginatedUsers { data: users, total, limit, offset });
+    }
+
+    // ── Sem paginação: retorna todos ───────────────────────────────────────
     let rows = match client
         .query(
             "SELECT id, name, email, age, created_at FROM users ORDER BY id",
@@ -177,7 +236,7 @@ async fn get_users(data: web::Data<AppState>) -> impl Responder {
         )
         .await
     {
-        Ok(r) => r,
+        Ok(r)  => r,
         Err(e) => {
             eprintln!("Query error: {e}");
             return HttpResponse::InternalServerError()
