@@ -61,7 +61,7 @@ func setupDB() *sql.DB {
 	// Connection pool tuning — mirrors the Node.js implementations (max: 10).
 	db.SetMaxOpenConns(10)
 	db.SetMaxIdleConns(10)
-	db.SetConnMaxLifetime(30 * time.Minute)
+	db.SetConnMaxLifetime(0) // sem limite de lifetime (igual aos outros frameworks)
 	db.SetConnMaxIdleTime(30 * time.Second)
 
 	// Verify connectivity before accepting traffic.
@@ -190,26 +190,32 @@ func handleDB(db *sql.DB) gin.HandlerFunc {
 	}
 }
 
-// GET /queries?count=N — N individual random-user queries (1-500, default 1)
+// GET /queries?count=N — N random users in a single query (1-500, default 1)
 func handleQueries(db *sql.DB) gin.HandlerFunc {
-	const query = `SELECT id, name, email, age, created_at FROM users ORDER BY RANDOM() LIMIT 1`
+	const query = `SELECT id, name, email, age, created_at FROM users ORDER BY RANDOM() LIMIT $1`
 
 	return func(c *gin.Context) {
 		count := parseCount(c.Query("count"))
 
+		rows, err := db.QueryContext(c.Request.Context(), query, count)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Database error", "detail": err.Error()})
+			return
+		}
+		defer rows.Close()
+
 		users := make([]User, 0, count)
-		for i := 0; i < count; i++ {
-			row := db.QueryRowContext(c.Request.Context(), query)
-			user, err := scanUser(row.Scan)
-			if err == sql.ErrNoRows {
-				// No data yet — return what we have so far.
-				break
-			}
+		for rows.Next() {
+			user, err := scanUser(rows.Scan)
 			if err != nil {
 				c.JSON(http.StatusInternalServerError, gin.H{"error": "Database error", "detail": err.Error()})
 				return
 			}
 			users = append(users, user)
+		}
+		if err := rows.Err(); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Database error", "detail": err.Error()})
+			return
 		}
 
 		c.JSON(http.StatusOK, users)
@@ -391,11 +397,14 @@ func handleCreateUser(db *sql.DB) gin.HandlerFunc {
 }
 
 // PUT /users/:id — update an existing user, respond with the updated object
+// Uses COALESCE to update only provided fields in a single query.
+// Same SQL pattern used by all 5 frameworks for fair comparison.
 func handleUpdateUser(db *sql.DB) gin.HandlerFunc {
-	const selectQuery = `SELECT id, name, email, age, created_at FROM users WHERE id = $1`
-	const updateQuery = `
+	const query = `
 		UPDATE users
-		SET name = $1, email = $2, age = $3
+		SET name  = COALESCE($1, name),
+		    email = COALESCE($2, email),
+		    age   = COALESCE($3, age)
 		WHERE id = $4
 		RETURNING id, name, email, age, created_at`
 
@@ -417,36 +426,9 @@ func handleUpdateUser(db *sql.DB) gin.HandlerFunc {
 			return
 		}
 
-		// Fetch the existing record to merge partial updates.
-		row := db.QueryRowContext(c.Request.Context(), selectQuery, id)
-		current, err := scanUser(row.Scan)
+		row := db.QueryRowContext(c.Request.Context(), query, req.Name, req.Email, req.Age, id)
+		updated, err := scanUser(row.Scan)
 		if err == sql.ErrNoRows {
-			c.JSON(http.StatusNotFound, gin.H{"error": "User not found"})
-			return
-		}
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Database error", "detail": err.Error()})
-			return
-		}
-
-		// Merge: use request value when provided, fall back to the current value.
-		newName := current.Name
-		if req.Name != nil {
-			newName = *req.Name
-		}
-		newEmail := current.Email
-		if req.Email != nil {
-			newEmail = *req.Email
-		}
-		newAge := current.Age
-		if req.Age != nil {
-			newAge = req.Age
-		}
-
-		updateRow := db.QueryRowContext(c.Request.Context(), updateQuery, newName, newEmail, newAge, id)
-		updated, err := scanUser(updateRow.Scan)
-		if err == sql.ErrNoRows {
-			// Race condition: deleted between SELECT and UPDATE.
 			c.JSON(http.StatusNotFound, gin.H{"error": "User not found"})
 			return
 		}

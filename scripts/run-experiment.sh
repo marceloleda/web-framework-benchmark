@@ -1,26 +1,27 @@
 #!/usr/bin/env bash
 # run-experiment.sh — orquestrador completo do experimento de eficiência energética
 #
+# Estratégia em 2 fases:
+#   FASE 1 — SATURAÇÃO: roda rampa progressiva em cada framework para descobrir
+#            o RPS máximo sustentável de cada um.
+#   FASE 2 — ENERGIA:   usa RPS comum = 70% do MENOR max sustentável entre todos.
+#            Isso garante carga significativa E igual para comparação justa.
+#
 # Procedimento:
-#   1. Verifica pré-requisitos
-#   2. Inicia o banco de dados
-#   3. Mede baseline de energia do sistema (idle)
-#   4. Para cada framework (5 APIs):
-#        a. Sobe apenas a API em questão
-#        b. [Fase saturação] Rampa 200→MAX_RPS para descobrir RPS máximo sustentável
-#        c. Aquece a API (warm-up de 30s)
-#        d. Executa N rodadas de carga na RPS definida (120s cada)
-#           - Lê RAPL antes e depois de cada rodada
-#           - Coleta CPU% e memória via docker stats
-#           - Salva resultado do k6 em CSV
-#        e. Derruba a API
-#   5. Chama analyze-results.py para computar métricas e gerar tabela final
-#   6. Exibe tabela no terminal
+#   1. Verifica pré-requisitos (k6, docker, python3, RAPL)
+#   2. Build das imagens (se necessário)
+#   3. Inicia o PostgreSQL
+#   4. Mede baseline de energia (sistema idle, 60s)
+#   5. FASE 1 — Saturação: para cada framework, roda rampa e detecta limite
+#   6. Calcula RPS comum (70% do menor max sustentável)
+#   7. FASE 2 — Energia: para cada framework, warm-up + N rodadas com RAPL
+#   8. Análise final (analyze-results.py)
 #
 # Uso:
 #   ./scripts/run-experiment.sh [--runs N] [--rps N] [--duration Xs]
 #                               [--max-rps N] [--step-rps N] [--step-duration Xs]
-#                               [--no-rapl] [--skip-build] [--skip-saturation]
+#                               [--load-pct N] [--no-rapl] [--skip-build]
+#                               [--skip-saturation]
 #
 set -euo pipefail
 
@@ -28,13 +29,14 @@ set -euo pipefail
 # Parâmetros (com defaults)
 # ---------------------------------------------------------------------------
 
-RUNS=5              # rodadas por framework
-TARGET_RPS=200      # requisições/segundo para fase de energia
+RUNS=5              # rodadas por framework na fase de energia
+TARGET_RPS=0        # 0 = auto (calculado a partir da saturação)
 DURATION=120s       # duração de cada rodada de energia
 WARMUP_DURATION=30s
 USE_RAPL=true       # desabilitar com --no-rapl
 SKIP_BUILD=false    # pular docker build com --skip-build
 SKIP_SATURATION=false # pular fase de saturação com --skip-saturation
+LOAD_PCT=70         # % do menor max sustentável a usar como RPS comum
 
 # Fase de saturação
 SAT_START_RPS=200
@@ -50,6 +52,7 @@ while [[ $# -gt 0 ]]; do
     --max-rps)          SAT_MAX_RPS="$2";       shift 2 ;;
     --step-rps)         SAT_STEP_RPS="$2";      shift 2 ;;
     --step-duration)    SAT_STEP_DURATION="$2"; shift 2 ;;
+    --load-pct)         LOAD_PCT="$2";          shift 2 ;;
     --no-rapl)          USE_RAPL=false;         shift   ;;
     --skip-build)       SKIP_BUILD=true;        shift   ;;
     --skip-saturation)  SKIP_SATURATION=true;   shift   ;;
@@ -117,6 +120,9 @@ declare -A FRAMEWORK_SERVICES=(
 
 FRAMEWORK_ORDER=(express fastify elysia actix gin)
 
+# Array para guardar max sustentável de cada framework
+declare -A FRAMEWORK_MAX_RPS=()
+
 # ---------------------------------------------------------------------------
 # Verifica pré-requisitos básicos
 # ---------------------------------------------------------------------------
@@ -142,35 +148,17 @@ fi
 
 if $USE_RAPL; then
   if [ ! -r "$RAPL_PATH" ]; then
-    log "RAPL não acessível em $RAPL_PATH — continuando sem medição RAPL"
-    USE_RAPL=false
+    error "RAPL não acessível em $RAPL_PATH"
+    error "Execute: sudo chmod a+r $RAPL_PATH"
+    error "RAPL é essencial para medição de energia. Abortando."
+    exit 1
   else
-    success "RAPL disponível"
+    RAPL_TEST=$(cat "$RAPL_PATH")
+    success "RAPL disponível (leitura atual: ${RAPL_TEST} µJ)"
   fi
 fi
 
 success "Todos os pré-requisitos OK"
-
-# ---------------------------------------------------------------------------
-# Salva configuração do experimento
-# ---------------------------------------------------------------------------
-
-cat > "$RESULTS_DIR/experiment_config.json" <<EOF
-{
-  "timestamp":   "$(date -Iseconds)",
-  "runs":        $RUNS,
-  "target_rps":  $TARGET_RPS,
-  "duration":    "$DURATION",
-  "rapl_used":   $USE_RAPL,
-  "rapl_path":   "$RAPL_PATH",
-  "hostname":    "$(hostname)",
-  "kernel":      "$(uname -r)",
-  "cpu_model":   "$(grep 'model name' /proc/cpuinfo 2>/dev/null | head -1 | cut -d: -f2 | xargs || echo unknown)",
-  "cpu_cores":   $(nproc),
-  "ram_gb":      $(awk '/MemTotal/{printf "%.1f", $2/1024/1024}' /proc/meminfo 2>/dev/null || echo 0)
-}
-EOF
-log "Configuração salva em $RESULTS_DIR/experiment_config.json"
 
 # ---------------------------------------------------------------------------
 # Build das imagens
@@ -227,7 +215,6 @@ if $USE_RAPL && [ "$BASELINE_RAPL_START" -ne 0 ]; then
   if [ "$BASELINE_RAPL_END" -ge "$BASELINE_RAPL_START" ]; then
     BASELINE_ENERGY_UJ=$(( BASELINE_RAPL_END - BASELINE_RAPL_START ))
   else
-    # max_energy_range_uj
     MAX_RANGE=$(cat /sys/class/powercap/intel-rapl/intel-rapl:0/max_energy_range_uj 2>/dev/null || echo "4294967296")
     BASELINE_ENERGY_UJ=$(( MAX_RANGE - BASELINE_RAPL_START + BASELINE_RAPL_END ))
   fi
@@ -249,44 +236,38 @@ cat > "$RESULTS_DIR/baseline.json" <<EOF
 EOF
 success "Baseline: ${BASELINE_POWER_W}W (${BASELINE_ENERGY_UJ}µJ em ${BASELINE_ELAPSED_MS}ms)"
 
-# ---------------------------------------------------------------------------
-# Experimento por framework
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# FASE 1 — SATURAÇÃO: descobre RPS máximo sustentável de cada framework
+# ===========================================================================
 
-SUMMARY_CSV="$RESULTS_DIR/summary.csv"
-echo "framework,run,rps,p50_ms,p95_ms,p99_ms,error_rate,rapl_start_uj,rapl_end_uj,energy_uj,elapsed_ms,power_watts,cpu_pct,mem_mb" > "$SUMMARY_CSV"
+if ! $SKIP_SATURATION; then
+  header "FASE 1 — Teste de Saturação (descobrindo limites)"
 
-for FRAMEWORK in "${FRAMEWORK_ORDER[@]}"; do
-  SERVICE="${FRAMEWORK_SERVICES[$FRAMEWORK]}"
-  PORT="${FRAMEWORK_PORTS[$FRAMEWORK]}"
-  API_URL="http://localhost:$PORT"
-  FW_DIR="$RESULTS_DIR/$FRAMEWORK"
-  mkdir -p "$FW_DIR"
+  for FRAMEWORK in "${FRAMEWORK_ORDER[@]}"; do
+    SERVICE="${FRAMEWORK_SERVICES[$FRAMEWORK]}"
+    PORT="${FRAMEWORK_PORTS[$FRAMEWORK]}"
+    API_URL="http://localhost:$PORT"
+    FW_DIR="$RESULTS_DIR/$FRAMEWORK"
+    mkdir -p "$FW_DIR"
 
-  header "Framework: $FRAMEWORK (porta $PORT)"
+    log "[$FRAMEWORK] Iniciando container $SERVICE..."
+    docker compose up -d "$SERVICE"
 
-  # --- Sobe a API ---
-  log "Iniciando container $SERVICE..."
-  docker compose up -d "$SERVICE"
+    log "[$FRAMEWORK] Aguardando API responder..."
+    for i in $(seq 1 30); do
+      if curl -sf "$API_URL/" &>/dev/null 2>&1; then
+        success "[$FRAMEWORK] API respondendo (tentativa $i)"
+        break
+      fi
+      if [ "$i" -eq 30 ]; then
+        error "[$FRAMEWORK] API não respondeu em 30s — pulando"
+        docker compose stop "$SERVICE"
+        continue 2
+      fi
+      sleep 1
+    done
 
-  log "Aguardando API responder em $API_URL/..."
-  for i in $(seq 1 30); do
-    if curl -sf "$API_URL/" &>/dev/null 2>&1; then
-      success "API $FRAMEWORK respondendo (tentativa $i)"
-      break
-    fi
-    if [ "$i" -eq 30 ]; then
-      error "API $FRAMEWORK não respondeu em 30s"
-      docker compose logs "$SERVICE" | tail -20 >&2
-      docker compose stop "$SERVICE"
-      continue 2
-    fi
-    sleep 1
-  done
-
-  # --- Fase de saturação: rampa progressiva para encontrar RPS máximo ---
-  if ! $SKIP_SATURATION; then
-    log "Iniciando teste de saturação: ${SAT_START_RPS}→${SAT_MAX_RPS} req/s (+${SAT_STEP_RPS}/degrau, ${SAT_STEP_DURATION}/degrau)..."
+    log "[$FRAMEWORK] Saturação: ${SAT_START_RPS}→${SAT_MAX_RPS} req/s (+${SAT_STEP_RPS}/degrau, ${SAT_STEP_DURATION}/degrau)..."
     SAT_CSV="$FW_DIR/saturation_${FRAMEWORK}.csv"
 
     k6 run \
@@ -310,14 +291,126 @@ for FRAMEWORK in "${FRAMEWORK_ORDER[@]}"; do
       2>/dev/null | grep '^RPS_MAX_SUSTAINABLE=' | cut -d= -f2 || echo "0")
 
     if [ -n "$MAX_SUSTAINABLE_RPS" ] && [ "$MAX_SUSTAINABLE_RPS" -gt 0 ]; then
-      success "RPS máximo sustentável ($FRAMEWORK): ${MAX_SUSTAINABLE_RPS} req/s"
+      success "[$FRAMEWORK] RPS máximo sustentável: ${MAX_SUSTAINABLE_RPS} req/s"
+      FRAMEWORK_MAX_RPS[$FRAMEWORK]=$MAX_SUSTAINABLE_RPS
       echo "$MAX_SUSTAINABLE_RPS" > "$FW_DIR/max_sustainable_rps.txt"
     else
-      warn "Não foi possível determinar RPS máximo (usando TARGET_RPS=$TARGET_RPS)"
+      warn "[$FRAMEWORK] Não foi possível determinar RPS máximo"
+      FRAMEWORK_MAX_RPS[$FRAMEWORK]=0
     fi
 
-    sleep 5  # deixa o sistema respirar após a rampa
+    # Derruba a API após saturação
+    docker compose stop "$SERVICE"
+    sleep 3
+  done
+
+  # --- Calcula RPS comum para a fase de energia ---
+  header "Resultado da Fase 1 — Limites de Saturação"
+
+  MIN_MAX_RPS=999999
+  for FRAMEWORK in "${FRAMEWORK_ORDER[@]}"; do
+    FW_MAX=${FRAMEWORK_MAX_RPS[$FRAMEWORK]:-0}
+    log "$FRAMEWORK: ${FW_MAX} req/s"
+    if [ "$FW_MAX" -gt 0 ] && [ "$FW_MAX" -lt "$MIN_MAX_RPS" ]; then
+      MIN_MAX_RPS=$FW_MAX
+    fi
+  done
+
+  if [ "$MIN_MAX_RPS" -eq 999999 ]; then
+    warn "Nenhum framework teve saturação detectada — usando fallback de 1000 req/s"
+    MIN_MAX_RPS=1000
   fi
+
+  # Calcula RPS da fase de energia (só se --rps não foi fornecido)
+  if [ "$TARGET_RPS" -eq 0 ]; then
+    TARGET_RPS=$(( MIN_MAX_RPS * LOAD_PCT / 100 ))
+    # Arredonda para múltiplo de 100
+    TARGET_RPS=$(( (TARGET_RPS + 50) / 100 * 100 ))
+    if [ "$TARGET_RPS" -lt 100 ]; then
+      TARGET_RPS=100
+    fi
+  fi
+
+  success "RPS comum para fase de energia: ${TARGET_RPS} req/s (${LOAD_PCT}% de ${MIN_MAX_RPS})"
+
+  # Salva resumo da saturação
+  cat > "$RESULTS_DIR/saturation_summary.json" <<SATEOF
+{
+  "framework_max_rps": {
+$(for FRAMEWORK in "${FRAMEWORK_ORDER[@]}"; do
+    echo "    \"$FRAMEWORK\": ${FRAMEWORK_MAX_RPS[$FRAMEWORK]:-0},"
+  done | sed '$ s/,$//')
+  },
+  "min_max_rps":       $MIN_MAX_RPS,
+  "load_pct":          $LOAD_PCT,
+  "target_rps":        $TARGET_RPS
+}
+SATEOF
+
+else
+  # Saturação pulada — usa TARGET_RPS fornecido ou default
+  if [ "$TARGET_RPS" -eq 0 ]; then
+    TARGET_RPS=1000
+    warn "Saturação pulada e --rps não fornecido — usando fallback de ${TARGET_RPS} req/s"
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+# Salva configuração do experimento
+# ---------------------------------------------------------------------------
+
+cat > "$RESULTS_DIR/experiment_config.json" <<EOF
+{
+  "timestamp":   "$(date -Iseconds)",
+  "runs":        $RUNS,
+  "target_rps":  $TARGET_RPS,
+  "duration":    "$DURATION",
+  "rapl_used":   $USE_RAPL,
+  "rapl_path":   "$RAPL_PATH",
+  "hostname":    "$(hostname)",
+  "kernel":      "$(uname -r)",
+  "cpu_model":   "$(grep 'model name' /proc/cpuinfo 2>/dev/null | head -1 | cut -d: -f2 | xargs || echo unknown)",
+  "cpu_cores":   $(nproc),
+  "ram_gb":      $(awk '/MemTotal/{printf "%.1f", $2/1024/1024}' /proc/meminfo 2>/dev/null || echo 0)
+}
+EOF
+
+# ===========================================================================
+# FASE 2 — ENERGIA: testa todos os frameworks com RPS comum
+# ===========================================================================
+
+header "FASE 2 — Medição de Energia (${TARGET_RPS} req/s × ${RUNS} rodadas × ${DURATION})"
+
+SUMMARY_CSV="$RESULTS_DIR/summary.csv"
+echo "framework,run,rps,p50_ms,p95_ms,p99_ms,error_rate,rapl_start_uj,rapl_end_uj,energy_uj,elapsed_ms,power_watts,cpu_pct,mem_mb" > "$SUMMARY_CSV"
+
+for FRAMEWORK in "${FRAMEWORK_ORDER[@]}"; do
+  SERVICE="${FRAMEWORK_SERVICES[$FRAMEWORK]}"
+  PORT="${FRAMEWORK_PORTS[$FRAMEWORK]}"
+  API_URL="http://localhost:$PORT"
+  FW_DIR="$RESULTS_DIR/$FRAMEWORK"
+  mkdir -p "$FW_DIR"
+
+  header "Energia: $FRAMEWORK (porta $PORT, ${TARGET_RPS} req/s)"
+
+  # --- Sobe a API ---
+  log "Iniciando container $SERVICE..."
+  docker compose up -d "$SERVICE"
+
+  log "Aguardando API responder em $API_URL/..."
+  for i in $(seq 1 30); do
+    if curl -sf "$API_URL/" &>/dev/null 2>&1; then
+      success "API $FRAMEWORK respondendo (tentativa $i)"
+      break
+    fi
+    if [ "$i" -eq 30 ]; then
+      error "API $FRAMEWORK não respondeu em 30s"
+      docker compose logs "$SERVICE" | tail -20 >&2
+      docker compose stop "$SERVICE"
+      continue 2
+    fi
+    sleep 1
+  done
 
   # --- Warm-up ---
   log "Warm-up de $WARMUP_DURATION ($FRAMEWORK)..."

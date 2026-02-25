@@ -250,27 +250,36 @@ fastify.put('/users/:id', {
   },
 }, async (req, reply) => {
   const id = parseInt(req.params.id, 10);
+  const { name, email, age } = req.body;
 
-  // Fetch existing record first
-  const existing = await pool.query(
-    'SELECT id, name, email, age, created_at FROM users WHERE id = $1',
-    [id]
-  );
-  if (existing.rows.length === 0) {
-    reply.code(404);
-    return { error: 'User not found' };
+  if (name === undefined && email === undefined && age === undefined) {
+    reply.code(400);
+    return { error: 'At least one field (name, email, age) is required' };
   }
 
-  const current = existing.rows[0];
-  const name  = req.body.name  !== undefined ? req.body.name  : current.name;
-  const email = req.body.email !== undefined ? req.body.email : current.email;
-  const age   = req.body.age   !== undefined ? req.body.age   : current.age;
+  try {
+    const { rows } = await pool.query(
+      `UPDATE users
+       SET name  = COALESCE($1, name),
+           email = COALESCE($2, email),
+           age   = COALESCE($3, age)
+       WHERE id = $4
+       RETURNING id, name, email, age, created_at`,
+      [name ?? null, email ?? null, age ?? null, id]
+    );
 
-  const { rows } = await pool.query(
-    'UPDATE users SET name = $1, email = $2, age = $3 WHERE id = $4 RETURNING id, name, email, age, created_at',
-    [name, email, age, id]
-  );
-  return rows[0];
+    if (rows.length === 0) {
+      reply.code(404);
+      return { error: 'User not found' };
+    }
+    return rows[0];
+  } catch (err) {
+    if (err.code === '23505') {
+      reply.code(409);
+      return { error: 'Email already in use' };
+    }
+    throw err;
+  }
 });
 
 // DELETE /users/:id — delete user

@@ -86,12 +86,13 @@ def load_k6_csv(path: str) -> dict:
                 continue
 
             try:
-                ts_ms = float(row.get('timestamp', 0))
-                val   = float(row.get('metric_value', 0))
+                ts_raw = float(row.get('timestamp', 0))
+                val    = float(row.get('metric_value', 0))
             except (ValueError, TypeError):
                 continue
 
-            ts_sec = int(ts_ms / 1000)
+            # k6 CSV timestamps: seconds since epoch (not milliseconds)
+            ts_sec = int(ts_raw)
 
             if metric == 'http_req_duration':
                 by_second[ts_sec]['durations'].append(val)
@@ -276,7 +277,7 @@ def print_table(steps, last_ok, first_sat, args):
 # Saída CSV por degrau
 # ---------------------------------------------------------------------------
 
-def write_step_csv(steps, last_ok, framework, output_dir: Path):
+def write_step_csv(steps, last_ok, framework, output_dir: Path, err_threshold: float, p99_threshold: float):
     out = output_dir / f'saturation_{framework}_analysis.csv'
     with open(out, 'w', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=[
@@ -286,7 +287,7 @@ def write_step_csv(steps, last_ok, framework, output_dir: Path):
         ])
         writer.writeheader()
         for s in steps:
-            sat = s['err_pct'] >= args.err_threshold or s['p99_ms'] >= args.p99_threshold
+            sat = s['err_pct'] >= err_threshold or s['p99_ms'] >= p99_threshold
             max_sus = 1 if last_ok and s['target_rps'] == last_ok['target_rps'] else 0
             writer.writerow({
                 'framework':      framework or 'unknown',
@@ -399,7 +400,7 @@ def main():
     print_table(steps, last_ok, first_sat, args)
 
     if args.framework:
-        write_step_csv(steps, last_ok, args.framework, output_dir)
+        write_step_csv(steps, last_ok, args.framework, output_dir, args.err_threshold, args.p99_threshold)
 
     if args.plot:
         plot_saturation(steps, last_ok, first_sat, args.framework, output_dir)

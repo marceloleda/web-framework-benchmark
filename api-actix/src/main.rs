@@ -3,6 +3,7 @@ use chrono::{DateTime, Utc};
 use deadpool_postgres::{Config as DeadpoolConfig, ManagerConfig, Pool, PoolConfig, RecyclingMethod, Runtime};
 use serde::{Deserialize, Serialize};
 use std::env;
+use std::time::Duration;
 use tokio_postgres::NoTls;
 
 // ---------------------------------------------------------------------------
@@ -339,76 +340,39 @@ async fn update_user(
         }
     };
 
-    // Build dynamic SET clause from the fields present in the body.
-    // We collect only the columns that were actually provided.
-    let mut set_clauses: Vec<String> = Vec::new();
-    let mut param_index: i32 = 1;
-
-    if body.name.is_some() {
-        set_clauses.push(format!("name = ${param_index}"));
-        param_index += 1;
-    }
-    if body.email.is_some() {
-        set_clauses.push(format!("email = ${param_index}"));
-        param_index += 1;
-    }
-    if body.age.is_some() {
-        set_clauses.push(format!("age = ${param_index}"));
-        param_index += 1;
+    if body.name.is_none() && body.email.is_none() && body.age.is_none() {
+        return HttpResponse::BadRequest()
+            .json(serde_json::json!({ "error": "At least one field (name, email, age) is required" }));
     }
 
-    if set_clauses.is_empty() {
-        // Nothing to update; fetch and return the existing record.
-        return match client
-            .query_opt(
-                "SELECT id, name, email, age, created_at FROM users WHERE id = $1",
-                &[&id],
-            )
-            .await
-        {
-            Ok(Some(row)) => HttpResponse::Ok().json(row_to_user(&row)),
-            Ok(None) => {
-                HttpResponse::NotFound().json(serde_json::json!({ "error": "User not found" }))
-            }
-            Err(e) => {
-                eprintln!("Query error: {e}");
-                HttpResponse::InternalServerError()
-                    .json(serde_json::json!({ "error": "Database query error" }))
-            }
-        };
-    }
+    // Use COALESCE to update only provided fields in a single query.
+    // Same SQL pattern used by all 5 frameworks for fair comparison.
+    let name_param: Option<&str> = body.name.as_deref();
+    let email_param: Option<&str> = body.email.as_deref();
+    let age_param: Option<i32> = body.age;
 
-    let sql = format!(
-        "UPDATE users SET {} WHERE id = ${} \
-         RETURNING id, name, email, age, created_at",
-        set_clauses.join(", "),
-        param_index
-    );
-
-    // Build the boxed parameter list dynamically.
-    // tokio-postgres expects &[&(dyn ToSql + Sync)].
-    let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync>> = Vec::new();
-    if let Some(ref name) = body.name {
-        params.push(Box::new(name.clone()));
-    }
-    if let Some(ref email) = body.email {
-        params.push(Box::new(email.clone()));
-    }
-    if let Some(age) = body.age {
-        params.push(Box::new(age));
-    }
-    params.push(Box::new(id));
-
-    // Convert to the slice form expected by tokio-postgres.
-    let params_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
-        params.iter().map(|p| p.as_ref()).collect();
-
-    match client.query_opt(&sql, params_refs.as_slice()).await {
+    match client
+        .query_opt(
+            "UPDATE users \
+             SET name  = COALESCE($1, name), \
+                 email = COALESCE($2, email), \
+                 age   = COALESCE($3, age) \
+             WHERE id = $4 \
+             RETURNING id, name, email, age, created_at",
+            &[&name_param, &email_param, &age_param, &id],
+        )
+        .await
+    {
         Ok(Some(row)) => HttpResponse::Ok().json(row_to_user(&row)),
         Ok(None) => {
             HttpResponse::NotFound().json(serde_json::json!({ "error": "User not found" }))
         }
         Err(e) => {
+            let err_str = e.to_string();
+            if err_str.contains("duplicate key value violates") {
+                return HttpResponse::Conflict()
+                    .json(serde_json::json!({ "error": "Email already in use" }));
+            }
             eprintln!("Update error: {e}");
             HttpResponse::InternalServerError()
                 .json(serde_json::json!({ "error": "Database update error" }))
@@ -496,8 +460,14 @@ fn build_pool(database_url: &str) -> Result<Pool, Box<dyn std::error::Error>> {
         recycling_method: RecyclingMethod::Fast,
     });
 
-    // `PoolConfig::new(max_size)` sets the maximum connection count.
-    cfg.pool = Some(PoolConfig::new(10));
+    // Pool: max 10 connections, idle timeout 30s — matches all other frameworks.
+    let mut pool_cfg = PoolConfig::new(10);
+    pool_cfg.timeouts.wait = Some(Duration::from_secs(2));   // connect timeout: 2s
+    pool_cfg.timeouts.recycle = Some(Duration::from_secs(30)); // idle timeout: 30s
+    cfg.pool = Some(pool_cfg);
+
+    // Set connect_timeout on the underlying tokio-postgres config too.
+    cfg.connect_timeout = Some(Duration::from_secs(2));
 
     let pool = cfg.create_pool(Some(Runtime::Tokio1), NoTls)?;
 

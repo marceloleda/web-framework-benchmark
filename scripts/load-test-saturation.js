@@ -14,23 +14,13 @@
  *     --out csv=results/saturation_express.csv \
  *     scripts/load-test-saturation.js
  *
- * Variáveis de ambiente:
- *   API_URL        — URL base da API          (default: http://localhost:3001)
- *   START_RPS      — RPS inicial              (default: 200)
- *   STEP_RPS       — incremento por degrau    (default: 200)
- *   MAX_RPS        — teto máximo de RPS       (default: 5000)
- *   STEP_DURATION  — tempo em cada degrau     (default: 30s)
- *   ERR_THRESHOLD  — % de erro para abortar   (default: 1)
- *   P99_THRESHOLD  — p99 máximo em ms         (default: 1000)
- *
- * Degraus gerados (exemplo com defaults):
- *   200 → 400 → 600 → ... → 5000 req/s
- *   Total: 25 degraus × 30s = ~12,5 min por framework
- *
- * Saída:
- *   - Terminal: progresso em tempo real via k6 (RPS real, latência, erros)
- *   - CSV (--out csv): série temporal com granularidade de 1s para pós-análise
- *   - handleSummary: tabela final + estimativa do ponto de saturação
+ * Distribuição de endpoints (~70% leitura, ~30% escrita):
+ *   35% GET  /db              — single random user (DB read)
+ *   20% GET  /queries?count=5 — multiple random users (DB reads)
+ *   15% GET  /json            — JSON puro, sem DB (overhead do framework)
+ *   15% GET  /users?limit=20  — listagem paginada (DB read + COUNT)
+ *   10% POST /users           — criar usuário (DB write + JSON parse)
+ *    5% PUT  /users/:id       — atualizar usuário (DB read + write)
  */
 
 import http from 'k6/http';
@@ -51,13 +41,6 @@ const P99_THRESHOLD = parseFloat(__ENV.P99_THRESHOLD || '1000'); // ms
 
 // ---------------------------------------------------------------------------
 // Geração dos degraus (escada)
-//
-// Padrão: para cada nível de carga → sobe rapidamente (2s) → mantém (STEP_DURATION)
-//
-// Ex: START=200, STEP=200, MAX=600, DURATION=30s
-//   stages: [ {dur:5s, target:200}, {dur:30s, target:200},
-//             {dur:2s, target:400}, {dur:30s, target:400},
-//             {dur:2s, target:600}, {dur:30s, target:600} ]
 // ---------------------------------------------------------------------------
 
 function parseDuration(s) {
@@ -70,13 +53,12 @@ const stepDurationSec = parseDuration(STEP_DURATION);
 
 const stages = [];
 
-// Primeiro degrau: sobe suavemente de 0 até START_RPS
 stages.push({ duration: '10s',         target: START_RPS });
 stages.push({ duration: STEP_DURATION, target: START_RPS });
 
 for (let rate = START_RPS + STEP_RPS; rate <= MAX_RPS; rate += STEP_RPS) {
-  stages.push({ duration: '2s',          target: rate }); // degrau rápido
-  stages.push({ duration: STEP_DURATION, target: rate }); // estabilização
+  stages.push({ duration: '2s',          target: rate });
+  stages.push({ duration: STEP_DURATION, target: rate });
 }
 
 const totalSteps = Math.ceil((MAX_RPS - START_RPS) / STEP_RPS) + 1;
@@ -95,12 +77,10 @@ export const options = {
       timeUnit:        '1s',
       stages:          stages,
       preAllocatedVUs: Math.ceil(START_RPS * 0.3),
-      maxVUs:          MAX_RPS * 2,  // pior caso: p99=500ms → 2 VUs por req/s
+      maxVUs:          MAX_RPS * 2,
     },
   },
 
-  // Aborta apenas em falhas catastróficas (>5× o threshold normal)
-  // Para detecção fina do ponto de saturação, use o CSV + find-saturation.py
   thresholds: {
     http_req_failed:   [{ threshold: `rate<${ERR_THRESHOLD * 5 / 100}`, abortOnFail: true }],
     http_req_duration: [{ threshold: `p(99)<${P99_THRESHOLD * 3}`,      abortOnFail: true }],
@@ -115,24 +95,50 @@ const dbLatency      = new Trend('sat_db_latency',      true);
 const queriesLatency = new Trend('sat_queries_latency',  true);
 const jsonLatency    = new Trend('sat_json_latency',     true);
 const usersLatency   = new Trend('sat_users_latency',    true);
+const createLatency  = new Trend('sat_create_latency',   true);
+const updateLatency  = new Trend('sat_update_latency',   true);
 const errorCounter   = new Counter('sat_errors');
 const successRate    = new Rate('sat_success_rate');
 
 // ---------------------------------------------------------------------------
-// Seleção de endpoint por peso (mesma distribuição do load-test-energy.js)
-// 40% /db · 25% /queries?count=5 · 20% /json · 15% /users?limit=20
+// Helpers para gerar dados de escrita
 // ---------------------------------------------------------------------------
 
-const ENDPOINTS = [
-  { weight: 40, name: 'db',      url: `${API_URL}/db` },
-  { weight: 25, name: 'queries', url: `${API_URL}/queries?count=5` },
-  { weight: 20, name: 'json',    url: `${API_URL}/json` },
-  { weight: 15, name: 'users',   url: `${API_URL}/users?limit=20&offset=0` },
+let writeCounter = 0;
+function uniqueEmail() {
+  writeCounter++;
+  return `sat_${__VU}_${writeCounter}_${Date.now()}@test.dev`;
+}
+
+function randomInt(min, max) {
+  return Math.floor(Math.random() * (max - min + 1)) + min;
+}
+
+const FIRST_NAMES = ['Ana','Carlos','Maria','Pedro','Julia','Lucas','Fernanda','Rafael','Camila','Diego'];
+const LAST_NAMES  = ['Silva','Santos','Oliveira','Costa','Lima','Pereira','Souza','Alves','Rocha','Ferreira'];
+
+function randomName() {
+  return FIRST_NAMES[randomInt(0, FIRST_NAMES.length - 1)] + ' ' +
+         LAST_NAMES[randomInt(0, LAST_NAMES.length - 1)];
+}
+
+// ---------------------------------------------------------------------------
+// Seleção de endpoint por peso (mesma distribuição do load-test-energy.js)
+// 35% /db · 20% /queries · 15% /json · 15% /users · 10% POST · 5% PUT
+// ---------------------------------------------------------------------------
+
+const ENDPOINT_WEIGHTS = [
+  { weight: 35, name: 'db'     },
+  { weight: 20, name: 'queries'},
+  { weight: 15, name: 'json'   },
+  { weight: 15, name: 'users'  },
+  { weight: 10, name: 'create' },
+  { weight:  5, name: 'update' },
 ];
 
 const cumulative = [];
 let acc = 0;
-for (const ep of ENDPOINTS) {
+for (const ep of ENDPOINT_WEIGHTS) {
   acc += ep.weight;
   cumulative.push({ threshold: acc, ...ep });
 }
@@ -140,9 +146,9 @@ for (const ep of ENDPOINTS) {
 function pickEndpoint() {
   const r = Math.random() * 100;
   for (const ep of cumulative) {
-    if (r < ep.threshold) return ep;
+    if (r < ep.threshold) return ep.name;
   }
-  return cumulative[cumulative.length - 1];
+  return cumulative[cumulative.length - 1].name;
 }
 
 // ---------------------------------------------------------------------------
@@ -152,25 +158,67 @@ function pickEndpoint() {
 const HEADERS = { 'Content-Type': 'application/json' };
 
 export default function () {
-  const ep  = pickEndpoint();
-  const res = http.get(ep.url, { headers: HEADERS, tags: { endpoint: ep.name } });
-  const ok  = res.status >= 200 && res.status < 300;
+  const epName = pickEndpoint();
+  let res;
+  let ok;
+
+  switch (epName) {
+    case 'db': {
+      res = http.get(`${API_URL}/db`, { headers: HEADERS, tags: { endpoint: 'db' } });
+      ok = res.status >= 200 && res.status < 300;
+      dbLatency.add(res.timings.duration);
+      break;
+    }
+    case 'queries': {
+      res = http.get(`${API_URL}/queries?count=5`, { headers: HEADERS, tags: { endpoint: 'queries' } });
+      ok = res.status >= 200 && res.status < 300;
+      queriesLatency.add(res.timings.duration);
+      break;
+    }
+    case 'json': {
+      res = http.get(`${API_URL}/json`, { headers: HEADERS, tags: { endpoint: 'json' } });
+      ok = res.status >= 200 && res.status < 300;
+      jsonLatency.add(res.timings.duration);
+      break;
+    }
+    case 'users': {
+      res = http.get(`${API_URL}/users?limit=20&offset=0`, { headers: HEADERS, tags: { endpoint: 'users' } });
+      ok = res.status >= 200 && res.status < 300;
+      usersLatency.add(res.timings.duration);
+      break;
+    }
+    case 'create': {
+      const payload = JSON.stringify({
+        name:  randomName(),
+        email: uniqueEmail(),
+        age:   randomInt(18, 65),
+      });
+      res = http.post(`${API_URL}/users`, payload, { headers: HEADERS, tags: { endpoint: 'create' } });
+      ok = res.status === 201 || res.status === 409;
+      createLatency.add(res.timings.duration);
+      break;
+    }
+    case 'update': {
+      const id = randomInt(1, 10000);
+      const payload = JSON.stringify({
+        name: randomName(),
+        age:  randomInt(18, 65),
+      });
+      res = http.put(`${API_URL}/users/${id}`, payload, { headers: HEADERS, tags: { endpoint: 'update' } });
+      ok = res.status >= 200 && res.status < 300;
+      updateLatency.add(res.timings.duration);
+      break;
+    }
+  }
 
   successRate.add(ok);
   if (!ok) errorCounter.add(1);
 
-  switch (ep.name) {
-    case 'db':      dbLatency.add(res.timings.duration);      break;
-    case 'queries': queriesLatency.add(res.timings.duration); break;
-    case 'json':    jsonLatency.add(res.timings.duration);    break;
-    case 'users':   usersLatency.add(res.timings.duration);   break;
-  }
-
-  check(res, { 'status 2xx': (r) => r.status >= 200 && r.status < 300 });
+  check(res, { 'status ok': (r) => r.status >= 200 && r.status < 300 || r.status === 409 });
 }
 
 // ---------------------------------------------------------------------------
-// Setup: verifica saúde da API antes de começar
+// Setup
 // ---------------------------------------------------------------------------
 
 export function setup() {
@@ -183,13 +231,14 @@ export function setup() {
     console.log(`[setup] API OK — framework: ${fw}, runtime: ${rt}`);
     console.log(`[setup] Degraus: ${START_RPS}→${MAX_RPS} req/s  (+${STEP_RPS}/degrau, ${STEP_DURATION}/degrau)`);
     console.log(`[setup] Total estimado: ~${totalMin} min  |  Degraus: ${totalSteps}`);
+    console.log(`[setup] Mix: 35% db, 20% queries, 15% json, 15% users, 10% create, 5% update`);
     console.log(`[setup] Abort em: erro>${ERR_THRESHOLD * 5}%  ou  p99>${P99_THRESHOLD * 3}ms`);
   }
   return { apiUrl: API_URL, startRps: START_RPS, stepRps: STEP_RPS, maxRps: MAX_RPS };
 }
 
 // ---------------------------------------------------------------------------
-// handleSummary: tabela resumo + nota sobre ponto de saturação
+// handleSummary
 // ---------------------------------------------------------------------------
 
 export function handleSummary(data) {
@@ -216,10 +265,7 @@ export function handleSummary(data) {
     `║  Latência P95:     ${p95.toFixed(2).padStart(8)} ms                              ║`,
     `║  Latência P99:     ${p99.toFixed(2).padStart(8)} ms                              ║`,
     '╠══════════════════════════════════════════════════════════════╣',
-    '║  Para encontrar o ponto exato de saturação, execute:        ║',
-    '║    python3 scripts/find-saturation.py \\                     ║',
-    '║      --csv results/saturation_<fw>.csv \\                    ║',
-    '║      --step-rps 200 --step-duration 30                      ║',
+    '║  Mix: 35%db 20%queries 15%json 15%users 10%create 5%update  ║',
     '╚══════════════════════════════════════════════════════════════╝',
     '',
   ];

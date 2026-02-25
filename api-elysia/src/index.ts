@@ -11,7 +11,7 @@ const PORT = Number(process.env.PORT ?? 3003);
 const sql = postgres(DATABASE_URL, {
   max: 10,
   idle_timeout: 30,
-  connect_timeout: 10,
+  connect_timeout: 2,
 });
 
 // ---------------------------------------------------------------------------

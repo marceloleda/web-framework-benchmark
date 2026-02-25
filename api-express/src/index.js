@@ -162,20 +162,14 @@ app.put('/users/:id', async (req, res) => {
   }
 
   try {
-    // Build a dynamic SET clause with only the provided fields
-    const fields = [];
-    const values = [];
-    let idx = 1;
-
-    if (name !== undefined)  { fields.push(`name = $${idx++}`);  values.push(name); }
-    if (email !== undefined) { fields.push(`email = $${idx++}`); values.push(email); }
-    if (age !== undefined)   { fields.push(`age = $${idx++}`);   values.push(age); }
-
-    values.push(id);
-
     const result = await pool.query(
-      `UPDATE users SET ${fields.join(', ')} WHERE id = $${idx} RETURNING id, name, email, age, created_at`,
-      values
+      `UPDATE users
+       SET name  = COALESCE($1, name),
+           email = COALESCE($2, email),
+           age   = COALESCE($3, age)
+       WHERE id = $4
+       RETURNING id, name, email, age, created_at`,
+      [name ?? null, email ?? null, age ?? null, id]
     );
 
     if (result.rows.length === 0) {
