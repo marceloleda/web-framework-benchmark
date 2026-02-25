@@ -27,6 +27,7 @@ import json
 import os
 import sys
 from pathlib import Path
+from typing import Optional
 
 import csv
 from collections import defaultdict
@@ -112,7 +113,7 @@ def load_summary(results_dir: Path) -> dict:
             })
     return dict(data)
 
-def load_baseline(results_dir: Path, cli_baseline: float | None) -> float:
+def load_baseline(results_dir: Path, cli_baseline: Optional[float]) -> float:
     """Retorna potência baseline em Watts."""
     if cli_baseline is not None and cli_baseline > 0:
         return cli_baseline

@@ -342,11 +342,18 @@ for FRAMEWORK in "${FRAMEWORK_ORDER[@]}"; do
     docker stats --no-trunc --format \
       "{{.Name}},{{.CPUPerc}},{{.MemUsage}}" \
       "$SERVICE" 2>/dev/null \
-      | awk -F',' -v OFS=',' '{
+      | awk -F',' '{
           t=systime();
-          cpu=$2; gsub(/%/,"",cpu);
-          mem=$3; gsub(/ MiB.*/,"",mem); gsub(/.*\//,"",mem);
-          print t, cpu, mem
+          # CPU: "0.05%" → 0.05
+          cpu=$2; gsub(/%/,"",cpu); cpu=cpu+0;
+          # MemUsage: "45.2MiB / 3.84GiB" → extrai apenas a parte usada (antes do " / ")
+          mem=$3; sub(/ \/ .*/,"",mem);
+          val=mem; gsub(/[^0-9.]/,"",val); val=val+0;
+          if (mem ~ /GiB/) val=val*1024;
+          else if (mem ~ /KiB/) val=val/1024;
+          else if (mem ~ /[0-9]B$/ && mem !~ /[KMGT]iB/) val=val/1048576;
+          # else já está em MiB
+          printf "%d,%.2f,%.1f\n", t, cpu, val
         }' >> "$STATS_FILE" &
     STATS_PID=$!
 
@@ -461,7 +468,11 @@ python3 "$ANALYZE_SCRIPT" \
 success "Análise concluída. Resultados em: $RESULTS_DIR"
 echo ""
 echo "Arquivos gerados:"
-ls -lh "$RESULTS_DIR"/*.{csv,json,txt,png} 2>/dev/null | awk '{print "  " $NF " (" $5 ")"}'
+find "$RESULTS_DIR" -maxdepth 1 -type f \( -name "*.csv" -o -name "*.json" -o -name "*.txt" -o -name "*.png" \) \
+  | sort | while read -r f; do
+    size=$(du -h "$f" 2>/dev/null | cut -f1)
+    echo "  $f ($size)"
+  done
 echo ""
 echo "Para ver a tabela final:"
 echo "  cat $RESULTS_DIR/final_table.txt"

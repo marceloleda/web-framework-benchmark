@@ -286,7 +286,7 @@ def write_step_csv(steps, last_ok, framework, output_dir: Path):
         ])
         writer.writeheader()
         for s in steps:
-            sat = s['err_pct'] >= 1.0 or s['p99_ms'] >= 1000
+            sat = s['err_pct'] >= args.err_threshold or s['p99_ms'] >= args.p99_threshold
             max_sus = 1 if last_ok and s['target_rps'] == last_ok['target_rps'] else 0
             writer.writerow({
                 'framework':      framework or 'unknown',

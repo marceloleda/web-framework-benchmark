@@ -60,6 +60,12 @@ else
   fail "python3 não encontrado"
 fi
 
+if command -v bc &>/dev/null; then
+  ok "bc encontrado (cálculos de energia)"
+else
+  fail "bc não encontrado — execute: sudo apt-get install bc"
+fi
+
 for pkg in numpy scipy pandas; do
   if python3 -c "import $pkg" &>/dev/null 2>&1; then
     ok "  pacote Python '$pkg' disponível"
