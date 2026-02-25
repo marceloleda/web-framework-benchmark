@@ -7,17 +7,20 @@
 #   3. Mede baseline de energia do sistema (idle)
 #   4. Para cada framework (5 APIs):
 #        a. Sobe apenas a API em questão
-#        b. Aquece a API (warm-up de 30s)
-#        c. Executa N rodadas de carga (120s cada)
+#        b. [Fase saturação] Rampa 200→MAX_RPS para descobrir RPS máximo sustentável
+#        c. Aquece a API (warm-up de 30s)
+#        d. Executa N rodadas de carga na RPS definida (120s cada)
 #           - Lê RAPL antes e depois de cada rodada
 #           - Coleta CPU% e memória via docker stats
 #           - Salva resultado do k6 em CSV
-#        d. Derruba a API
+#        e. Derruba a API
 #   5. Chama analyze-results.py para computar métricas e gerar tabela final
 #   6. Exibe tabela no terminal
 #
 # Uso:
-#   ./scripts/run-experiment.sh [--runs N] [--rps N] [--duration Xs] [--no-rapl] [--skip-build]
+#   ./scripts/run-experiment.sh [--runs N] [--rps N] [--duration Xs]
+#                               [--max-rps N] [--step-rps N] [--step-duration Xs]
+#                               [--no-rapl] [--skip-build] [--skip-saturation]
 #
 set -euo pipefail
 
@@ -25,20 +28,31 @@ set -euo pipefail
 # Parâmetros (com defaults)
 # ---------------------------------------------------------------------------
 
-RUNS=5            # rodadas por framework
-TARGET_RPS=200    # requisições/segundo
-DURATION=120s     # duração de cada rodada de carga
+RUNS=5              # rodadas por framework
+TARGET_RPS=200      # requisições/segundo para fase de energia
+DURATION=120s       # duração de cada rodada de energia
 WARMUP_DURATION=30s
-USE_RAPL=true     # desabilitar com --no-rapl
-SKIP_BUILD=false  # pular docker build com --skip-build
+USE_RAPL=true       # desabilitar com --no-rapl
+SKIP_BUILD=false    # pular docker build com --skip-build
+SKIP_SATURATION=false # pular fase de saturação com --skip-saturation
+
+# Fase de saturação
+SAT_START_RPS=200
+SAT_STEP_RPS=200
+SAT_MAX_RPS=5000
+SAT_STEP_DURATION=30s
 
 while [[ $# -gt 0 ]]; do
   case $1 in
-    --runs)     RUNS="$2";         shift 2 ;;
-    --rps)      TARGET_RPS="$2";   shift 2 ;;
-    --duration) DURATION="$2";     shift 2 ;;
-    --no-rapl)  USE_RAPL=false;    shift   ;;
-    --skip-build) SKIP_BUILD=true; shift   ;;
+    --runs)             RUNS="$2";              shift 2 ;;
+    --rps)              TARGET_RPS="$2";        shift 2 ;;
+    --duration)         DURATION="$2";          shift 2 ;;
+    --max-rps)          SAT_MAX_RPS="$2";       shift 2 ;;
+    --step-rps)         SAT_STEP_RPS="$2";      shift 2 ;;
+    --step-duration)    SAT_STEP_DURATION="$2"; shift 2 ;;
+    --no-rapl)          USE_RAPL=false;         shift   ;;
+    --skip-build)       SKIP_BUILD=true;        shift   ;;
+    --skip-saturation)  SKIP_SATURATION=true;   shift   ;;
     *) echo "Argumento desconhecido: $1"; exit 1 ;;
   esac
 done
@@ -66,6 +80,7 @@ RED='\033[0;31m';  BOLD='\033[1m';      NC='\033[0m'
 log()     { echo -e "${CYAN}[$(date +%H:%M:%S)]${NC} $*"; }
 success() { echo -e "${GREEN}[$(date +%H:%M:%S)] ✓${NC} $*"; }
 error()   { echo -e "${RED}[$(date +%H:%M:%S)] ✗${NC} $*" >&2; }
+warn()    { echo -e "${YELLOW}[$(date +%H:%M:%S)] !${NC} $*"; }
 header()  { echo -e "\n${BOLD}${YELLOW}=== $* ===${NC}\n"; }
 
 # Lê contador RAPL em µJ (retorna 0 se indisponível)
@@ -268,6 +283,41 @@ for FRAMEWORK in "${FRAMEWORK_ORDER[@]}"; do
     fi
     sleep 1
   done
+
+  # --- Fase de saturação: rampa progressiva para encontrar RPS máximo ---
+  if ! $SKIP_SATURATION; then
+    log "Iniciando teste de saturação: ${SAT_START_RPS}→${SAT_MAX_RPS} req/s (+${SAT_STEP_RPS}/degrau, ${SAT_STEP_DURATION}/degrau)..."
+    SAT_CSV="$FW_DIR/saturation_${FRAMEWORK}.csv"
+
+    k6 run \
+      -e API_URL="$API_URL" \
+      -e START_RPS="$SAT_START_RPS" \
+      -e STEP_RPS="$SAT_STEP_RPS" \
+      -e MAX_RPS="$SAT_MAX_RPS" \
+      -e STEP_DURATION="$SAT_STEP_DURATION" \
+      --out "csv=$SAT_CSV" \
+      "$SCRIPT_DIR/load-test-saturation.js" || true
+
+    # Detecta ponto de saturação e extrai RPS máximo sustentável
+    MAX_SUSTAINABLE_RPS=$(python3 "$SCRIPT_DIR/find-saturation.py" \
+      --csv "$SAT_CSV" \
+      --start-rps "$SAT_START_RPS" \
+      --step-rps  "$SAT_STEP_RPS" \
+      --step-duration "$(echo "$SAT_STEP_DURATION" | tr -d 's')" \
+      --framework "$FRAMEWORK" \
+      --output-dir "$FW_DIR" \
+      --plot \
+      2>/dev/null | grep '^RPS_MAX_SUSTAINABLE=' | cut -d= -f2 || echo "0")
+
+    if [ -n "$MAX_SUSTAINABLE_RPS" ] && [ "$MAX_SUSTAINABLE_RPS" -gt 0 ]; then
+      success "RPS máximo sustentável ($FRAMEWORK): ${MAX_SUSTAINABLE_RPS} req/s"
+      echo "$MAX_SUSTAINABLE_RPS" > "$FW_DIR/max_sustainable_rps.txt"
+    else
+      warn "Não foi possível determinar RPS máximo (usando TARGET_RPS=$TARGET_RPS)"
+    fi
+
+    sleep 5  # deixa o sistema respirar após a rampa
+  fi
 
   # --- Warm-up ---
   log "Warm-up de $WARMUP_DURATION ($FRAMEWORK)..."
